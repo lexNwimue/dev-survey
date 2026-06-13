@@ -5,12 +5,15 @@
 1. [Project structure](#1-project-structure)
 2. [Database schema](#2-database-schema)
 3. [Enum definitions](#3-enum-definitions)
-4. [Shared application state](#4-shared-application-state)
-5. [Error handling strategy](#5-error-handling-strategy)
-6. [API contracts](#6-api-contracts)
-7. [Request and response shapes](#7-request-and-response-shapes)
-8. [Auth implementation](#8-auth-implementation)
-9. [Profile dual-write logic](#9-profile-dual-write-logic)
+4. [Question and answer types](#4-question-and-answer-types)
+5. [Shared application state](#5-shared-application-state)
+6. [Error handling strategy](#6-error-handling-strategy)
+7. [API contracts](#7-api-contracts)
+8. [Request and response shapes](#8-request-and-response-shapes)
+9. [Auth implementation](#9-auth-implementation)
+10. [Profile dual-write logic](#10-profile-dual-write-logic)
+11. [Skip logic](#11-skip-logic)
+12. [Seed structure](#12-seed-structure)
 
 ---
 
@@ -19,7 +22,7 @@
 The backend is a single Cargo workspace with one binary crate and one seed binary. No microservices, no workspace members in v1. Module organisation follows the modern Rust convention — named files instead of `mod.rs`, with sibling `.rs` files declaring submodules.
 
 ```
-dev-survey/
+nigerian-dev-survey/
 ├── Cargo.toml
 ├── Cargo.lock
 ├── .env
@@ -58,7 +61,7 @@ dev-survey/
     ├── handlers/
     │   ├── meta.rs                 # GET /meta/enums
     │   ├── surveys.rs              # Public survey endpoints
-    │   ├── responses.rs            # Response submission endpoints
+    │   ├── responses.rs            # Answer submission and skip endpoints
     │   ├── results.rs              # Public results endpoint
     │   └── admin.rs                # Declares admin handler submodules
     │   └── admin/
@@ -71,12 +74,12 @@ dev-survey/
         ├── surveys.rs              # Survey queries
         ├── sections.rs             # Section queries (read-only)
         ├── questions.rs            # Question queries (read-only)
-        ├── responses.rs            # Response queries + dual-write
+        ├── responses.rs            # Response upsert + dual-write
         ├── user_surveys.rs         # UserSurvey queries
         └── results.rs              # Aggregation queries
 ```
 
-A seed binary lives at `src/bin/seed.rs`. It shares the same models, enums, and database connection logic as the main binary. It reads `seed.json`, connects to the database, and upserts sections and questions for a given survey slug. It is safe to run multiple times — all inserts are upserts on `(survey_id, order_index)`.
+A seed binary lives at `src/bin/seed.rs`. It shares the same models, enums, and database connection logic as the main binary. It reads `seed.json`, connects to the database, and upserts sections and questions for a given survey slug. On re-run it deletes and re-seeds only the survey structure (surveys, sections, questions) — users and responses are never touched by the seed.
 
 **Layer responsibilities:**
 
@@ -84,7 +87,7 @@ A seed binary lives at `src/bin/seed.rs`. It shares the same models, enums, and 
 
 `repository/` — All database interaction. Plain functions, no traits. SQLx queries live here. Functions return domain types or `AppError`. Transactions are managed here.
 
-`models/` — Rust structs that represent database rows. Read-side types only. Not used as request/response bodies directly — see section 7 for where those diverge.
+`models/` — Rust structs that represent database rows. Read-side types only. Not used as request/response bodies directly — see section 8 for where those diverge.
 
 `enums/` — All enum definitions. Single source of truth. Consumed by `/meta/enums` and by the repository layer for profile field mapping.
 
@@ -175,7 +178,11 @@ CREATE TABLE surveys (
     slug              TEXT NOT NULL UNIQUE,
     status            TEXT NOT NULL DEFAULT 'draft'
                           CHECK (status IN ('draft', 'active', 'closed')),
+    welcome_message   TEXT,
+    thank_you_message TEXT,
+    estimated_minutes INTEGER,
     results_published BOOLEAN NOT NULL DEFAULT FALSE,
+    published_at      TIMESTAMPTZ,
     opens_at          TIMESTAMPTZ,
     closes_at         TIMESTAMPTZ,
     created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -190,7 +197,7 @@ BEFORE UPDATE ON surveys
 FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 ```
 
-`results_published` is independent of `status`. A survey can only have `results_published = true` when `status = 'closed'` — enforced at the application layer.
+`results_published` is independent of `status`. A survey can only have `results_published = true` when `status = 'closed'` — enforced at the application layer. `published_at` is set in the same operation that flips `results_published` to `true`.
 
 ---
 
@@ -216,7 +223,7 @@ BEFORE UPDATE ON sections
 FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 ```
 
-`order_index` is unique per survey. The constraint is `DEFERRABLE INITIALLY DEFERRED` so that reordering operations within a transaction do not trigger a constraint violation mid-flight — the uniqueness check is deferred to commit time.
+`order_index` is unique per survey. The constraint is `DEFERRABLE INITIALLY DEFERRED` so that reordering operations within a transaction do not trigger a constraint violation mid-flight.
 
 ---
 
@@ -224,17 +231,19 @@ FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
 ```sql
 CREATE TABLE questions (
-    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    survey_id   UUID NOT NULL REFERENCES surveys (id) ON DELETE CASCADE,
-    section_id  UUID NOT NULL REFERENCES sections (id) ON DELETE CASCADE,
-    text        TEXT NOT NULL,
-    type        TEXT NOT NULL
-                    CHECK (type IN ('single_choice', 'multi_choice', 'text', 'scale')),
-    options     JSONB,
-    required    BOOLEAN NOT NULL DEFAULT TRUE,
-    order_index INTEGER NOT NULL,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    survey_id     UUID NOT NULL REFERENCES surveys (id) ON DELETE CASCADE,
+    section_id    UUID NOT NULL REFERENCES sections (id) ON DELETE CASCADE,
+    text          TEXT NOT NULL,
+    description   TEXT,
+    type          TEXT NOT NULL
+                      CHECK (type IN ('single_choice', 'multi_choice', 'text', 'scale')),
+    options       JSONB,
+    is_required   BOOLEAN NOT NULL DEFAULT TRUE,
+    order_index   INTEGER NOT NULL,
+    profile_field TEXT,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
     UNIQUE (survey_id, order_index) DEFERRABLE INITIALLY DEFERRED
 );
@@ -247,26 +256,40 @@ BEFORE UPDATE ON questions
 FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 ```
 
-`survey_id` is kept as a denormalisation for query convenience — fetching all questions for a survey without joining through sections. `order_index` is unique across the entire survey, not just within a section. The question with the highest `order_index` for a survey is implicitly the last question — when a response is submitted for it, the backend marks the UserSurvey as `complete` automatically.
+`description` is optional helper text displayed below the question text in the frontend. `is_required` replaces the previous `required` column — naming is consistent with the skip mechanic. `profile_field` is a nullable TEXT column populated via `seed.json`. When non-null, it identifies which column on the `users` table to update in the dual-write transaction. `survey_id` is a denormalisation for query convenience. `order_index` is unique across the entire survey.
 
 **Options JSONB shapes:**
 
 ```json
-// single_choice / multi_choice — each option carries a stable key and display label
+// single_choice
 [
   { "key": "BE", "label": "Backend Engineer" },
-  { "key": "FE", "label": "Frontend Engineer" },
-  { "key": "FS", "label": "Fullstack Engineer" }
+  { "key": "FE", "label": "Frontend Engineer" }
 ]
 
-// scale — min and max bounds only
-{ "min": 1, "max": 5 }
+// multi_choice — includes selection constraints
+{
+  "options": [
+    { "key": "JS", "label": "JavaScript / TypeScript" },
+    { "key": "PY", "label": "Python" }
+  ],
+  "min_selections": 1,
+  "max_selections": 3
+}
 
-// text — no options
-null
+// scale
+{
+  "min": 1,
+  "max": 10,
+  "min_label": "Not at all likely",
+  "max_label": "Extremely likely"
+}
+
+// text
+{ "max_length": 500 }
 ```
 
-Option keys are assigned in `seed.json` when questions are defined. Keys must be unique within a question's options array. Labels can be updated freely — responses store keys, never labels, so label changes do not affect existing response data.
+`max_selections` is nullable — absence means unlimited. `min_label` and `max_label` on scale are nullable — absence means no end labels are shown. `max_length` on text is nullable — absence means no character limit.
 
 ---
 
@@ -290,7 +313,7 @@ CREATE INDEX idx_user_surveys_user_id ON user_surveys (user_id);
 CREATE INDEX idx_user_surveys_survey_id ON user_surveys (survey_id);
 ```
 
-`UNIQUE (user_id, survey_id)` enforces one participation record per user per survey edition. The application upserts on this pair. No `updated_at` on this table — `current_question_order`, `status`, and `completed_at` are updated directly and their change history is not needed.
+`UNIQUE (user_id, survey_id)` enforces one participation record per user per survey edition. The application upserts on this pair. `current_question_order` always points to the next unanswered question — advanced on both answer submission and skips. No `updated_at` on this table — field changes are direct and their history is not needed.
 
 ---
 
@@ -318,7 +341,7 @@ BEFORE UPDATE ON responses
 FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 ```
 
-`UNIQUE (user_id, question_id)` enforces one answer per user per question. All answer writes are upserts on this pair. `survey_id` is kept as a denormalisation — it makes aggregation queries significantly simpler without joining through questions.
+`UNIQUE (user_id, question_id)` enforces one answer per user per question. All answer writes are upserts on this pair. `survey_id` is a denormalisation for aggregation query convenience. Skipped questions produce no row.
 
 **Answer JSONB shapes by question type:**
 
@@ -329,14 +352,12 @@ FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 // multi_choice — array of selected option keys
 ["JS", "RU", "PY"]
 
-// text — raw string, no key needed
+// text — raw string
 "I think the ecosystem is growing fast but needs more senior mentors."
 
-// scale — integer within the question's defined min/max bounds
-4
+// scale — integer within the question's min/max bounds
+7
 ```
-
-Responses store option keys, never labels. The display label is always derived at read time from the question's options array. Labels can be corrected or rephrased without affecting the integrity of any stored response.
 
 ---
 
@@ -411,7 +432,7 @@ The same pattern applies to `JobRole` and `PrimaryLanguage`.
 
 ### Direct enums
 
-Direct enums use SQLx's `rename_all` to ensure the stored string is always snake_case and independent of the Rust variant name. This means renaming a variant in Rust does not change the value stored in the database — the `rename_all` attribute is the authoritative mapping.
+Direct enums use SQLx's `rename_all` to ensure the stored string is always snake_case and independent of the Rust variant name. Renaming a variant in Rust does not change the stored value — the `rename_all` attribute is the authoritative mapping.
 
 ```rust
 // enums/direct.rs
@@ -480,16 +501,160 @@ pub enum Gender {
 
 ---
 
-## 4. Shared application state
+## 4. Question and answer types
 
-Axum passes shared state to handlers via `axum::extract::State` with a single `AppState` struct.
+Questions and answers are modelled as Rust enums with typed variants. This is the equivalent of TypeScript's union types — each variant carries its own data and the compiler enforces exhaustive handling.
+
+### `QuestionKind`
+
+```rust
+// models/question.rs
+
+pub struct QuestionOption {
+    pub key:   String,
+    pub label: String,
+}
+
+pub enum QuestionKind {
+    SingleChoice {
+        options: Vec<QuestionOption>,
+    },
+    MultiChoice {
+        options:        Vec<QuestionOption>,
+        min_selections: u32,            // default 1
+        max_selections: Option<u32>,    // None means unlimited
+    },
+    Scale {
+        min:       i32,
+        max:       i32,
+        min_label: Option<String>,
+        max_label: Option<String>,
+    },
+    Text {
+        max_length: Option<u32>,        // Default limit: 1000
+    },
+}
+```
+
+`QuestionKind` is reconstructed from the `type` TEXT column and `options` JSONB column when a question row is read from the database. The repository function `build_question_kind` handles this:
+
+```rust
+// repository/questions.rs
+
+fn build_question_kind(
+    type_str: &str,
+    options_json: Option<serde_json::Value>,
+) -> Result<QuestionKind, AppError> {
+    match type_str {
+        "single_choice" => { /* deserialise options into Vec<QuestionOption> */ }
+        "multi_choice"  => { /* deserialise options + min/max_selections */ }
+        "scale"         => { /* deserialise min, max, min_label, max_label */ }
+        "text"          => { /* deserialise max_length */ }
+        _ => Err(AppError::Internal(anyhow!("Unknown question type: {}", type_str)))
+    }
+}
+```
+
+### `AnswerValue`
+
+```rust
+// models/response.rs
+
+pub enum AnswerValue {
+    SingleChoice { key: String },
+    MultiChoice  { keys: Vec<String> },
+    Scale        { value: i32 },
+    Text         { value: String },
+}
+```
+
+### Validation
+
+Answer validation pairs the question kind with the answer value. The compiler forces exhaustive handling of every combination:
+
+```rust
+pub fn validate_answer(
+    kind: &QuestionKind,
+    answer: &AnswerValue,
+) -> Result<(), AppError> {
+    match (kind, answer) {
+        (QuestionKind::SingleChoice { options }, AnswerValue::SingleChoice { key }) => {
+            if !options.iter().any(|o| &o.key == key) {
+                return Err(AppError::Validation("Key does not exist in options".into()));
+            }
+            Ok(())
+        }
+
+        (QuestionKind::MultiChoice { options, min_selections, max_selections },
+         AnswerValue::MultiChoice { keys }) => {
+            if keys.len() < *min_selections as usize {
+                return Err(AppError::Validation(
+                    format!("Must select at least {} option(s)", min_selections)
+                ));
+            }
+            if let Some(max) = max_selections {
+                if keys.len() > *max as usize {
+                    return Err(AppError::Validation(
+                        format!("Cannot select more than {} options", max)
+                    ));
+                }
+            }
+            let has_duplicate = {
+                let mut seen = std::collections::HashSet::new();
+                keys.iter().any(|k| !seen.insert(k))
+            };
+            if has_duplicate {
+                return Err(AppError::Validation("Duplicate keys in answer".into()));
+            }
+            for key in keys {
+                if !options.iter().any(|o| &o.key == key) {
+                    return Err(AppError::Validation(
+                        format!("Invalid key: {}", key)
+                    ));
+                }
+            }
+            Ok(())
+        }
+
+        (QuestionKind::Scale { min, max, .. }, AnswerValue::Scale { value }) => {
+            if value < min || value > max {
+                return Err(AppError::Validation(
+                    format!("Value must be between {} and {}", min, max)
+                ));
+            }
+            Ok(())
+        }
+
+        (QuestionKind::Text { max_length }, AnswerValue::Text { value }) => {
+            if value.is_empty() {
+                return Err(AppError::Validation("Answer cannot be empty".into()));
+            }
+            if let Some(max) = max_length {
+                if value.len() > *max as usize {
+                    return Err(AppError::Validation(
+                        format!("Answer exceeds {} character limit", max)
+                    ));
+                }
+            }
+            Ok(())
+        }
+
+        // Mismatched kind and answer — should never happen if the frontend is correct
+        _ => Err(AppError::Validation("Answer type does not match question type".into())),
+    }
+}
+```
+
+---
+
+## 5. Shared application state
 
 ```rust
 // state.rs
 
 #[derive(Clone)]
 pub struct AppState {
-    pub db: PgPool,
+    pub db:     PgPool,
     pub config: Arc<Config>,
 }
 ```
@@ -515,7 +680,7 @@ impl Config {
 
 ---
 
-## 5. Error handling strategy
+## 6. Error handling strategy
 
 All errors funnel through a single `AppError` type. Every handler returns `Result<impl IntoResponse, AppError>`. The `?` operator propagates errors to the handler boundary.
 
@@ -573,11 +738,11 @@ Each variant maps to an HTTP status code and a standard JSON error body:
 { "error": "Human-readable error message" }
 ```
 
-Database errors that represent expected failure cases — unique constraint violations, not-found conditions — are caught in the repository layer and converted to the appropriate `AppError` variant before returning to the handler. The handler never sees a raw `sqlx::Error` for expected failures.
+Database errors that represent expected failure cases — unique constraint violations, not-found — are caught in the repository layer and converted to the appropriate `AppError` variant. The handler never sees a raw `sqlx::Error` for expected failures.
 
 ---
 
-## 6. API contracts
+## 7. API contracts
 
 ### Conventions
 
@@ -595,9 +760,10 @@ Database errors that represent expected failure cases — unique constraint viol
 | Method | Path | Description |
 |---|---|---|
 | GET | `/meta/enums` | Return all enum definitions for frontend use |
-| GET | `/surveys/:slug` | Fetch active survey with sections and questions |
-| POST | `/surveys/:slug/start` | Start or resume a survey — creates or looks up user |
+| GET | `/surveys/:slug` | Fetch active survey with sections, questions, and metadata |
+| POST | `/surveys/:slug/start` | Start or resume a survey — upserts user and UserSurvey |
 | POST | `/surveys/:slug/responses` | Submit or update a single answer |
+| POST | `/surveys/:slug/skip` | Skip a non-required question |
 | GET | `/surveys/:slug/results` | Fetch public aggregate results (published surveys only) |
 
 ### Admin endpoints (`x-api-key` required)
@@ -609,7 +775,7 @@ Database errors that represent expected failure cases — unique constraint viol
 | GET | `/admin/surveys/:id` | Get a survey with sections and questions |
 | PATCH | `/admin/surveys/:id` | Update survey metadata |
 | PATCH | `/admin/surveys/:id/status` | Transition survey status |
-| PATCH | `/admin/surveys/:id/publish-results` | Publish results publicly |
+| PATCH | `/admin/surveys/:id/publish-results` | Publish results and record published_at |
 | DELETE | `/admin/surveys/:id` | Delete a draft survey |
 | GET | `/admin/surveys/:id/results` | View aggregate results (any status) |
 | GET | `/admin/surveys/:id/responses` | List raw responses, paginated |
@@ -618,60 +784,58 @@ Database errors that represent expected failure cases — unique constraint viol
 
 ---
 
-## 7. Request and response shapes
+## 8. Request and response shapes
 
-This section covers cases where the Rust representation diverges from the database schema — create/update structs, computed fields, and flattened or nested shapes.
+### `GET /surveys/:slug`
 
-### `GET /surveys/:slug` — survey with sections and questions
+Returns survey metadata including `welcome_message`, `thank_you_message`, `estimated_minutes`, and `total_questions` (computed from the question count). Questions are nested under their sections. Both sections and questions include `order_index` for reliable frontend sorting. Each question includes its `description`, `is_required`, and the fully typed `options` shape for its kind.
 
-Questions are nested under their sections. The `order_index` field is included on both sections and questions so the frontend can sort without assumptions.
+### `POST /surveys/:slug/start`
 
-### `POST /surveys/:slug/start` — start or resume
+Returns the same shape whether the user is new or returning. `existing_responses` is an empty array on first start and populated with all previously submitted answers on resume. `first_name` and `last_name` are required only when creating a new user — on resume they are ignored and the original name is preserved. Returns `current_question_order` pointing to the next unanswered question.
 
-Returns the same shape whether the user is new or returning. `existing_responses` is an empty array on first start and populated on resume. `first_name` and `last_name` are required on first start — ignored on resume, original name is preserved.
+### `POST /surveys/:slug/responses`
 
-### `POST /surveys/:slug/responses` — submit an answer
+Answer shape by question type: `single_choice` takes a string key, `multi_choice` takes an array of string keys, `scale` takes an integer, `text` takes a raw string. Response includes `survey_complete: true` when the answered question has the highest `order_index` — the frontend uses this to show the `thank_you_message` screen.
 
-For `single_choice`, the answer is a string key. For `multi_choice`, an array of string keys. For `scale`, an integer. For `text`, a raw string. The response includes `survey_complete: true` when the answered question has the highest `order_index` in the survey — the frontend uses this to show the completion screen without a separate endpoint call.
+### `POST /surveys/:slug/skip`
 
-### `GET /surveys/:slug/results` — public results
+Request carries `user_id` and `question_id`. Response includes `survey_complete: true` if the skipped question was the last. No `Response` row is created.
 
-Results are nested by section then question. Each question's aggregation shape differs by type: choice questions return option counts and percentages; scale questions return mean, median, and value distribution; text questions return paginated raw responses. The optional `filter_key` and `filter_value` query params restrict aggregation to users matching a profile field value — see the high-level spec for the filtering rationale.
+### `GET /surveys/:slug/results`
 
-### `GET /admin/surveys` — survey list
+Results nested by section then question. Aggregation shape per type: choice questions return option counts and percentages keyed to option labels (derived from the question's options array at read time); scale questions return mean, median, and value distribution; text questions return paginated raw responses. Supports optional `filter_key` and `filter_value` query params to restrict aggregation to users matching a profile field value.
 
-Includes a computed `total_responses` field per survey — a `COUNT` over `user_surveys` where `status = 'complete'`. This is joined at query time, not stored on the `surveys` table.
+### `GET /admin/surveys`
 
-### `GET /admin/users/:id` — user detail
+Includes a computed `total_responses` field per survey — a `COUNT` over `user_surveys` where `status = 'complete'`. Joined at query time, not stored.
 
-Returns the full profile object with all enum fields, plus a `surveys` array showing participation status, start time, and completion time per survey edition the user has started.
+### `GET /admin/users/:id`
 
-### Question `options` in responses
+Returns the full profile object with all enum fields resolved to their display labels, plus a `surveys` array showing participation status, start time, and completion time per survey the user has started.
 
-`options` is always returned as a typed array of `{ key, label }` objects for choice types, or a `{ min, max }` object for scale types — never as raw JSONB. The repository layer deserialises before returning to the handler.
+### Question options in all responses
 
-### Admin token response
-
-There is no login endpoint or token response. The admin token is a static value set in `.env` and sent as `x-api-key` on every request.
+`options` is always returned as a fully typed structure — never raw JSONB. The repository layer deserialises before returning to the handler.
 
 ---
 
-## 8. Auth implementation
+## 9. Auth implementation
 
-Admin authentication uses a single static API key stored in the environment. There are no login endpoints, no token expiry, and no database involvement in auth.
+Admin authentication uses a single static API key stored in the environment. No login endpoints, no token expiry, no database involvement.
 
 ```
 # .env
 ADMIN_TOKEN=your_generated_token_here
 ```
 
-Generate the token once:
+Generate once:
 
 ```bash
 openssl rand -hex 32
 ```
 
-The auth middleware is a custom Axum extractor that implements `FromRequestParts`. It reads the `x-api-key` header and compares it to `config.admin_token` using a constant-time comparison to prevent timing attacks:
+The auth middleware is a custom Axum extractor implementing `FromRequestParts`. It reads the `x-api-key` header and compares it to `config.admin_token` using constant-time comparison to prevent timing attacks:
 
 ```rust
 // middleware/auth.rs
@@ -707,21 +871,19 @@ where
 }
 ```
 
-`constant_time_eq` comes from the `constant_time_eq` crate. This prevents timing attacks where an attacker could infer the correct token by measuring how long comparisons take.
-
 Handlers that require admin auth add `AdminAuth` as an extractor parameter. Its value is never used — it exists purely as a guard.
 
 ---
 
-## 9. Profile dual-write logic
+## 10. Profile dual-write logic
 
-Certain questions map to profile fields on the `users` table. When a response is submitted for one of these questions, two writes happen in a single transaction: the `responses` row is upserted, and the corresponding `users` column is updated.
+Certain questions map to profile fields on the `users` table. The mapping is driven by the `profile_field` column on the `questions` table — populated via `seed.json`, read at runtime by the repository. No hardcoded UUIDs.
 
-### The mapping
-
-The mapping is a static `HashMap<Uuid, ProfileField>` defined in `repository/responses.rs`. The key is the question UUID — known at seed time and defined as a constant. The value is an enum identifying which profile column to update.
+### `ProfileField` enum
 
 ```rust
+// repository/responses.rs
+
 pub enum ProfileField {
     JobRole,
     State,
@@ -735,13 +897,32 @@ pub enum ProfileField {
     NyscStatus,
     EarningCurrency,
 }
-```
 
-`Assumption →` Question UUIDs for profile-building questions are defined as constants in the codebase after the seed runs. A more flexible approach — a `profile_field` column on the `questions` table settable via `seed.json` — is a future consideration.
+impl FromStr for ProfileField {
+    type Err = AppError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "job_role"         => Ok(Self::JobRole),
+            "state"            => Ok(Self::State),
+            "primary_language" => Ok(Self::PrimaryLanguage),
+            "age_range"        => Ok(Self::AgeRange),
+            "experience_range" => Ok(Self::ExperienceRange),
+            "gender"           => Ok(Self::Gender),
+            "education_level"  => Ok(Self::EducationLevel),
+            "employment_type"  => Ok(Self::EmploymentType),
+            "work_arrangement" => Ok(Self::WorkArrangement),
+            "nysc_status"      => Ok(Self::NyscStatus),
+            "earning_currency" => Ok(Self::EarningCurrency),
+            _ => Err(AppError::Internal(anyhow!("Unknown profile field: {}", s))),
+        }
+    }
+}
+```
 
 ### The transaction
 
-All writes for a single response submission happen in one transaction: the response upsert, the `current_question_order` update on `user_surveys`, the profile field update (if applicable), and the completion check. If any step fails, the entire operation rolls back.
+All writes for a single response submission happen in one transaction. If any step fails, the entire operation rolls back:
 
 ```rust
 // repository/responses.rs (pseudocode)
@@ -749,18 +930,131 @@ All writes for a single response submission happen in one transaction: the respo
 pub async fn upsert_response(
     pool: &PgPool,
     payload: UpsertResponsePayload,
-    profile_mapping: &HashMap<Uuid, ProfileField>,
 ) -> Result<UpsertResponseResult, AppError> {
     let mut tx = pool.begin().await?;
 
-    // 1. Upsert the response row
-    // 2. Update current_question_order on user_surveys
-    // 3. If question maps to a profile field, update users
-    // 4. Check if this is the last question in the survey
-    // 5. If last, set user_surveys status = 'complete' and completed_at = NOW()
+    // 1. Fetch the question to get type, options, and profile_field
+    // 2. Validate the answer against the question kind
+    // 3. Upsert the response row
+    // 4. If profile_field is Some, update the matching column on users
+    // 5. Advance current_question_order on user_surveys
+    // 6. Check if this is the last question (highest order_index for the survey)
+    // 7. If last, set user_surveys status = 'complete' and completed_at = NOW()
 
     tx.commit().await?;
 
     Ok(UpsertResponseResult { survey_complete: is_last })
 }
 ```
+
+---
+
+## 11. Skip logic
+
+Skipping is handled by a dedicated endpoint — `POST /surveys/:slug/skip`. It does not create a `Response` row. It only advances `current_question_order` and, if the skipped question is the last, marks the `UserSurvey` as complete.
+
+```rust
+// repository/user_surveys.rs (pseudocode)
+
+pub async fn skip_question(
+    pool: &PgPool,
+    payload: SkipQuestionPayload,
+) -> Result<SkipResult, AppError> {
+    let mut tx = pool.begin().await?;
+
+    // 1. Fetch the question — verify it belongs to this survey and is_required = false
+    // 2. Advance current_question_order on user_surveys
+    // 3. Check if this is the last question
+    // 4. If last, set user_surveys status = 'complete' and completed_at = NOW()
+
+    tx.commit().await?;
+
+    Ok(SkipResult { survey_complete: is_last })
+}
+```
+
+**Resume behaviour after a skip:** `current_question_order` is advanced by the skip. If the user stops after skipping but before answering the next question, `current_question_order` points to the question after the skipped one. The skipped question therefore does not reappear on resume — the user left it behind intentionally. If they want to revise a skipped answer, the frontend can allow backwards navigation using the `existing_responses` data returned by the start endpoint, but this is a frontend concern not a backend one.
+
+---
+
+## 12. Seed structure
+
+The seed binary lives at `src/bin/seed.rs`. It reads `seed.json`, connects to the database using the same `Config` and `PgPool` setup as the main binary, and upserts the survey structure.
+
+**Re-seed behaviour:** On re-run, the seed deletes all sections and questions for the target survey (cascade handles child records), then re-inserts from `seed.json`. The survey row itself is upserted on `slug`. Users and responses are never touched.
+
+**Seed order:** Survey → Sections → Questions. Each step depends on the previous.
+
+### `seed.json` shape
+
+```json
+{
+  "slug": "nds-2026",
+  "title": "Nigeria Developer Survey 2026",
+  "welcome_message": "Welcome! This survey takes about 10 minutes and helps map the Nigerian developer ecosystem.",
+  "thank_you_message": "Thank you for participating. Results will be published later this year.",
+  "estimated_minutes": 10,
+  "sections": [
+    {
+      "title": "About You",
+      "description": "Tell us about yourself and your background.",
+      "order_index": 1,
+      "questions": [
+        {
+          "text": "What is your primary job role?",
+          "description": "Select the role that best describes your main day-to-day work.",
+          "type": "single_choice",
+          "is_required": true,
+          "order_index": 1,
+          "profile_field": "job_role",
+          "options": [
+            { "key": "BE", "label": "Backend Engineer" },
+            { "key": "FE", "label": "Frontend Engineer" },
+            { "key": "FS", "label": "Fullstack Engineer" }
+          ]
+        },
+        {
+          "text": "Which state are you based in?",
+          "description": null,
+          "type": "single_choice",
+          "is_required": true,
+          "order_index": 2,
+          "profile_field": "state",
+          "options": [
+            { "key": "LA", "label": "Lagos" },
+            { "key": "FCT", "label": "Abuja" },
+            { "key": "RV", "label": "Rivers" }
+          ]
+        },
+        {
+          "text": "How would you rate your satisfaction with the Nigerian developer ecosystem?",
+          "description": "1 = Very unsatisfied, 10 = Very satisfied",
+          "type": "scale",
+          "is_required": false,
+          "order_index": 3,
+          "profile_field": null,
+          "options": {
+            "min": 1,
+            "max": 10,
+            "min_label": "Very unsatisfied",
+            "max_label": "Very satisfied"
+          }
+        },
+        {
+          "text": "What is one thing you wish more people knew about being a developer in Nigeria?",
+          "description": null,
+          "type": "text",
+          "is_required": false,
+          "order_index": 4,
+          "profile_field": null,
+          "options": {
+            "max_length": 500
+          }
+        }
+      ]
+    }
+  ]
+}
+```
+
+`profile_field` is `null` for questions that do not update the user profile. The seed binary parses this and writes it directly to the `profile_field` column on the `questions` table.
