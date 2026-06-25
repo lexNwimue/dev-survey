@@ -1,6 +1,6 @@
 use axum::{Router, routing::get};
+use dev_survey::env_config::{self, EnvConfig};
 use sqlx::postgres::PgPoolOptions;
-use std::env;
 
 
 #[tokio::main]
@@ -12,10 +12,10 @@ async fn main() {
    
     let app = Router::new().route("/", get(|| async { "Hello world."}));
 
-    let database_uri = env::var("DATABASE_URI").expect("Could not start server due to missing env");
+    let EnvConfig {database_uri, port}  = env_config::EnvConfig::parse();
 
     PgPoolOptions::new().max_connections(3).connect(&database_uri).await.expect("Could not start server");
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await.unwrap();
+    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await.unwrap();
     axum::serve(listener, app).await.unwrap();
 }
