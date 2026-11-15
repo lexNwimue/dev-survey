@@ -1,21 +1,24 @@
-use axum::{Router, routing::get};
-use dev_survey::env_config::{self, EnvConfig};
-use sqlx::postgres::PgPoolOptions;
+use std::sync::Arc;
 
+use dev_survey::{db::config::connect_db, env_config, handlers, state::AppState};
 
 #[tokio::main]
 async fn main() {
-
     println!("Starting server...🕙");
-
     dotenvy::dotenv().expect("env file not found");
-   
-    let app = Router::new().route("/", get(|| async { "Hello world."}));
 
-    let EnvConfig {database_uri, port}  = env_config::EnvConfig::parse();
+    let config = env_config::EnvConfig::parse();
 
-    PgPoolOptions::new().max_connections(3).connect(&database_uri).await.expect("Could not start server");
+    let db = connect_db(&config.database_url)
+        .await
+        .expect("unable to connect to db");
 
-    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await.unwrap();
+    let state = Arc::new(AppState { config, db });
+
+    let app = handlers::all_routes();
+
+    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", state.config.port))
+        .await
+        .unwrap();
     axum::serve(listener, app).await.unwrap();
 }

@@ -178,9 +178,6 @@ CREATE TABLE surveys (
     slug              TEXT NOT NULL UNIQUE,
     status            TEXT NOT NULL DEFAULT 'draft'
                           CHECK (status IN ('draft', 'active', 'closed')),
-    welcome_message   TEXT,
-    thank_you_message TEXT,
-    estimated_minutes INTEGER,
     results_published BOOLEAN NOT NULL DEFAULT FALSE,
     published_at      TIMESTAMPTZ,
     opens_at          TIMESTAMPTZ,

@@ -495,11 +495,11 @@ pub struct AppState {
 ```
 
 ```rust
-// config.rs
+// env_config.rs
 
 #[derive(Debug, Clone)]
 pub struct Config {
-    pub database_url: String,
+    pub database_uri: String,
     pub admin_token:  String,
     pub server_port:  u16,
 }
