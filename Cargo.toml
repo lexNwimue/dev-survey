@@ -4,7 +4,18 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+anyhow = "1.0.104"
 axum = "0.8.9"
 dotenvy = "0.15.7"
-sqlx = { version = "0.9.0", features = ["runtime-tokio", "postgres"] }
+serde = "1.0.229"
+serde_json = "1.0.151"
 tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread"] }
+tower = "0.5.3"
+tower-http = { version = "0.7.1", features = ["trace", "cors", "timeout", "compression-br", "request-id"]}
+sea-orm = {version = "2.0.4", features = ["sqlx-postgres", "runtime-tokio-native-tls", "macros"]}
+migration = {path = "migration"}
+chrono = "=0.4.45"
+
+
+[workspace]
+members = [".", "migration"]
